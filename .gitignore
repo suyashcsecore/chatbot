@@ -1,0 +1,89 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+career_env/
+venv/
+.venv/
+env/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+*.env
+
+# Build outputs
+dist/
+build/
+.next/
+out/
+.cache/
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.nyc_output/
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+
+# Python
+*.egg-info/
+*.egg
+eggs/
+*.whl
+pip-log.txt
+pip-delete-this-directory.txt
+
+# TypeScript
+*.tsbuildinfo
+
+# Uploads (temporary)
+uploads/
+*.tmp
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Model files (large)
+models/*.joblib
+data/processed/rag_index.joblib
+
+# Docker
+.dockerignore
+
+# Misc
+*.bak
+*.orig
+*.rej
+
+# Internal tooling
+docs/compose/
