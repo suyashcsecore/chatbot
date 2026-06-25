@@ -1,8 +1,5 @@
 fastapi==0.115.0
 uvicorn==0.30.0
-scikit-learn==1.8.0
-pandas==3.0.3
-joblib==1.5.3
 openai==2.9.0
 python-dotenv==1.2.1
 pdfplumber==0.11.8

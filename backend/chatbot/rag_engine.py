@@ -1,78 +1,145 @@
-"""Dataset-grounded RAG engine and Kimi chat orchestration."""
-
-from __future__ import annotations
-
+import csv
+import math
+import pickle
+import re
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from scipy.sparse import vstack
-import joblib
-
-from pathlib import Path
-
-RAW_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "processed"
 from backend.core.api_manager import APIKeyPoolExhaustedError, APIManager
 from backend.core.logger import get_logger
 from backend.chatbot.fallback import extractive_summary_from_chunks
 
 LOGGER = get_logger(__name__)
+RAW_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "processed"
 
 
 @dataclass(frozen=True)
 class DatasetChunk:
     """Searchable dataset text chunk with source metadata."""
-
     source: str
     row_id: int
     text: str
     metadata: Mapping[str, Any]
 
 
+class TfidfVectorizerPure:
+    """Pure Python implementation of TF-IDF."""
+    def __init__(self, max_features=12000):
+        self.max_features = max_features
+        self.vocab = {}
+        self.idf = {}
+        self.stop_words = {"the", "is", "in", "and", "to", "a", "of", "for", "with", "on", "at", "by", "from", "as", "an"}
+    
+    def tokenize(self, text: str) -> list[str]:
+        words = re.findall(r'\b[a-z0-9]+\b', text.lower())
+        return [w for w in words if w not in self.stop_words]
+        
+    def fit_transform(self, docs: list[str]):
+        tf_list = []
+        df = defaultdict(int)
+        
+        for doc in docs:
+            tokens = self.tokenize(doc)
+            if len(tokens) > 1:
+                bigrams = [f"{tokens[i]} {tokens[i+1]}" for i in range(len(tokens)-1)]
+                tokens.extend(bigrams)
+                
+            tf = defaultdict(int)
+            for token in tokens:
+                tf[token] += 1
+            
+            tf_list.append(tf)
+            for token in set(tokens):
+                df[token] += 1
+                
+        N = len(docs)
+        for token, count in df.items():
+            self.idf[token] = math.log((1 + N) / (1 + count)) + 1
+            
+        sorted_vocab = sorted(self.idf.items(), key=lambda x: x[1], reverse=True)[:self.max_features]
+        self.vocab = {k: v for k, v in sorted_vocab}
+        
+        return self._transform_tf_list(tf_list)
+        
+    def transform(self, docs: list[str]):
+        tf_list = []
+        for doc in docs:
+            tokens = self.tokenize(doc)
+            if len(tokens) > 1:
+                bigrams = [f"{tokens[i]} {tokens[i+1]}" for i in range(len(tokens)-1)]
+                tokens.extend(bigrams)
+            tf = defaultdict(int)
+            for token in tokens:
+                tf[token] += 1
+            tf_list.append(tf)
+        return self._transform_tf_list(tf_list)
+        
+    def _transform_tf_list(self, tf_list):
+        matrix = []
+        for tf in tf_list:
+            vec = {}
+            norm = 0.0
+            for term, count in tf.items():
+                if term in self.vocab:
+                    val = count * self.vocab[term]
+                    vec[term] = val
+                    norm += val * val
+            norm = math.sqrt(norm)
+            if norm > 0:
+                vec = {k: v / norm for k, v in vec.items()}
+            matrix.append(vec)
+        return matrix
+
+
+def cosine_similarity_pure(query_vec, matrix):
+    """Compute cosine similarity natively."""
+    scores = []
+    for doc_vec in matrix:
+        score = 0.0
+        for term, val in query_vec.items():
+            if term in doc_vec:
+                score += val * doc_vec[term]
+        scores.append(score)
+    return scores
+
+
 class DatasetRAGEngine:
-    """Build and query a lightweight vector index over local career datasets."""
+    """Build and query a lightweight vector index over local career datasets natively."""
 
     def __init__(self, raw_dir: Path = RAW_DATA_DIR, max_rows_per_file: int = 2500) -> None:
-        """Initialize the RAG engine with a raw dataset directory."""
         self.raw_dir = raw_dir
         self.max_rows_per_file = max_rows_per_file
         self.chunks: list[DatasetChunk] = []
-        self._vectorizer: TfidfVectorizer | None = None
-        self._matrix: Any = None
-        # temporary uploaded chunks and combined matrix for ephemeral context
+        self._vectorizer: TfidfVectorizerPure | None = None
+        self._matrix: list[dict] = []
         self._temp_chunks: list[DatasetChunk] = []
-        self._temp_matrix: Any = None
-        self._combined_matrix: Any = None
+        self._temp_matrix: list[dict] = []
+        self._combined_matrix: list[dict] = []
 
     def discover_dataset_files(self, limit: int | None = None) -> list[Path]:
-        """Return CSV datasets from the configured raw directory."""
         if not self.raw_dir.exists():
             return []
         files = sorted(path for path in self.raw_dir.glob("*.csv") if path.is_file())
         return files if limit is None else files[:limit]
 
     def build_index(self) -> int:
-        """Load datasets and build a local TF-IDF vector index."""
         self.chunks = self._load_chunks()
         if not self.chunks:
             self._vectorizer = None
-            self._matrix = None
+            self._matrix = []
             return 0
-        self._vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=12000)
+        self._vectorizer = TfidfVectorizerPure()
         self._matrix = self._vectorizer.fit_transform([chunk.text for chunk in self.chunks])
-        # reset temp structures
         self._temp_chunks = []
-        self._temp_matrix = None
-        self._combined_matrix = self._matrix
+        self._temp_matrix = []
+        self._combined_matrix = self._matrix[:]
         LOGGER.info("Built RAG index with %s chunks from %s.", len(self.chunks), self.raw_dir)
         return len(self.chunks)
 
     def save_index(self, out_path: Path) -> None:
-        """Persist the vectorizer, matrix, and chunk metadata to disk using joblib."""
-        if self._vectorizer is None or self._matrix is None:
+        if self._vectorizer is None or not self._matrix:
             raise RuntimeError("Index not built; call build_index() before saving.")
         out_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -80,66 +147,59 @@ class DatasetRAGEngine:
             "matrix": self._matrix,
             "chunks": self.chunks,
         }
-        joblib.dump(payload, out_path)
+        with out_path.open('wb') as f:
+            pickle.dump(payload, f)
         LOGGER.info("Saved RAG index to %s", out_path)
 
     def load_index(self, in_path: Path) -> int:
-        """Load a previously saved index from disk. Returns number of chunks loaded."""
         if not in_path.exists():
             raise FileNotFoundError(in_path)
-        payload = joblib.load(in_path)
+        with in_path.open('rb') as f:
+            payload = pickle.load(f)
         self._vectorizer = payload.get("vectorizer")
-        self._matrix = payload.get("matrix")
+        self._matrix = payload.get("matrix", [])
         self.chunks = payload.get("chunks", [])
         LOGGER.info("Loaded RAG index from %s with %s chunks", in_path, len(self.chunks))
         return len(self.chunks)
 
     def retrieve(self, query: str, top_k: int = 5) -> list[DatasetChunk]:
-        """Retrieve the most relevant dataset chunks for a user query."""
         if not query.strip() or top_k <= 0:
             return []
-        if self._vectorizer is None or self._matrix is None:
+        if self._vectorizer is None or not self._matrix:
             self.build_index()
-        if self._vectorizer is None or self._matrix is None or not self.chunks:
+        if self._vectorizer is None or not self._matrix or not self.chunks:
             return []
-        matrix = self._combined_matrix if self._combined_matrix is not None else self._matrix
-        query_vector = self._vectorizer.transform([query])
-        scores = cosine_similarity(query_vector, matrix).ravel()
-        ranked_indexes = scores.argsort()[::-1][:top_k]
-        # map indexes to chunks (base chunks followed by temp chunks if present)
-        all_chunks = list(self.chunks) + list(self._temp_chunks)
+        matrix = self._combined_matrix if self._combined_matrix else self._matrix
+        query_vector = self._vectorizer.transform([query])[0]
+        scores = cosine_similarity_pure(query_vector, matrix)
+        
+        ranked_indexes = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+        
+        all_chunks = self.chunks + self._temp_chunks
         results: list[DatasetChunk] = []
-        for index in ranked_indexes:
-            idx = int(index)
+        for idx in ranked_indexes:
             if idx < 0 or idx >= len(all_chunks):
                 continue
-            if float(scores[idx]) <= 0:
+            if scores[idx] <= 0:
                 continue
             results.append(all_chunks[idx])
         return results
 
     def context_block(self, query: str, top_k: int = 5) -> str:
-        """Return retrieved context formatted for a chat system prompt."""
         chunks = self.retrieve(query, top_k)
         if not chunks:
             return "No relevant local dataset context was retrieved."
-        lines: list[str] = []
+        lines = []
         for chunk in chunks:
             lines.append(f"Source: {chunk.source} row {chunk.row_id}\n{chunk.text}")
         return "\n\n".join(lines)
 
     def add_temporary_chunks(self, texts: Sequence[str], source: str = "uploaded_resume") -> int:
-        """Add ephemeral chunks (e.g., uploaded resume text) to the index for the current session.
-
-        These chunks are not persisted and will be cleared by `clear_temporary_chunks()`.
-        Returns the number of temporary chunks currently held.
-        """
-        if self._vectorizer is None or self._matrix is None:
-            # ensure base index exists
+        if self._vectorizer is None or not self._matrix:
             self.build_index()
         if self._vectorizer is None:
             return 0
-        new_chunks: list[DatasetChunk] = []
+        new_chunks = []
         texts_list = [str(t) for t in texts if t]
         if not texts_list:
             return 0
@@ -147,54 +207,53 @@ class DatasetRAGEngine:
         for i, t in enumerate(texts_list):
             new_chunks.append(DatasetChunk(source=source, row_id=start_id - i, text=t, metadata={}))
         temp_mat = self._vectorizer.transform(texts_list)
-        if self._temp_matrix is None:
+        if not self._temp_matrix:
             self._temp_matrix = temp_mat
         else:
-            self._temp_matrix = vstack([self._temp_matrix, temp_mat])
-        # update combined matrix and chunks
+            self._temp_matrix.extend(temp_mat)
         self._temp_chunks.extend(new_chunks)
-        if self._matrix is not None:
-            self._combined_matrix = vstack([self._matrix, self._temp_matrix])
-        else:
-            self._combined_matrix = self._temp_matrix
+        self._combined_matrix = self._matrix + self._temp_matrix
         return len(self._temp_chunks)
 
     def clear_temporary_chunks(self) -> None:
-        """Remove any ephemeral chunks and restore the original index state."""
         self._temp_chunks = []
-        self._temp_matrix = None
-        self._combined_matrix = self._matrix
+        self._temp_matrix = []
+        self._combined_matrix = self._matrix[:]
 
     def _load_chunks(self) -> list[DatasetChunk]:
-        """Read CSV files into compact row-level text chunks."""
-        chunks: list[DatasetChunk] = []
+        chunks = []
         for path in self.discover_dataset_files():
             try:
-                dataframe = pd.read_csv(path, nrows=self.max_rows_per_file)
+                with path.open('r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    if not reader.fieldnames:
+                        continue
+                    for row_id, row in enumerate(reader):
+                        if row_id >= self.max_rows_per_file:
+                            break
+                        text = self._row_to_text(row)
+                        if text:
+                            chunks.append(
+                                DatasetChunk(
+                                    source=path.name,
+                                    row_id=row_id,
+                                    text=text,
+                                    metadata={"columns": list(reader.fieldnames)},
+                                )
+                            )
             except Exception as exc:
                 LOGGER.warning("Skipping dataset %s because it could not be read: %s", path.name, exc)
                 continue
-            for row_id, row in dataframe.fillna("").iterrows():
-                text = self._row_to_text(row)
-                if text:
-                    chunks.append(
-                        DatasetChunk(
-                            source=path.name,
-                            row_id=int(row_id),
-                            text=text,
-                            metadata={"columns": list(dataframe.columns)},
-                        )
-                    )
         return chunks
 
     @staticmethod
-    def _row_to_text(row: pd.Series) -> str:
-        """Convert a dataframe row into a compact natural-language chunk."""
-        parts: list[str] = []
+    def _row_to_text(row: dict) -> str:
+        parts = []
         for column, value in row.items():
-            cleaned = str(value).strip()
-            if cleaned:
-                parts.append(f"{column}: {cleaned}")
+            if value:
+                cleaned = str(value).strip()
+                if cleaned:
+                    parts.append(f"{column}: {cleaned}")
         return " | ".join(parts)
 
 
@@ -208,7 +267,6 @@ class KimiRAGChatbot:
         reranker: Any | None = None,
         model: str | None = None,
     ) -> None:
-        """Initialize chatbot dependencies."""
         self.api_manager = api_manager or APIManager()
         self.rag_engine = rag_engine or DatasetRAGEngine()
         self.reranker = reranker
@@ -221,8 +279,6 @@ class KimiRAGChatbot:
         uploaded_resume_context: str = "",
         internet_context: str = "",
     ) -> str:
-        """Answer a user query using local dataset context, optional resume text, and Kimi."""
-        # If an uploaded resume context is supplied, add it as a temporary chunk so retrieval can prioritize it
         added_temp = 0
         if uploaded_resume_context and uploaded_resume_context.strip():
             try:
@@ -230,15 +286,8 @@ class KimiRAGChatbot:
             except Exception:
                 added_temp = 0
 
-        retrieved = self.rag_engine.retrieve(user_query, top_k=12)
-        if self.reranker is not None and retrieved:
-            chunk_dicts = [
-                {"row_id": c.row_id, "source": c.source, "text": c.text}
-                for c in retrieved
-            ]
-            reranked = self.reranker.rerank(user_query, chunk_dicts)
-            retrieved = [DatasetChunk(source=item.source, row_id=item.row_id, text=item.text, metadata={}) for item in reranked[:5]]
-
+        retrieved = self.rag_engine.retrieve(user_query, top_k=5)
+        
         dataset_context = "\n\n".join(f"Source: {c.source} row {c.row_id}\n{c.text}" for c in retrieved)
         system_prompt = (
             "You are an AI job advisor. Ground answers in the supplied local dataset context when it is relevant. "
@@ -272,7 +321,6 @@ class KimiRAGChatbot:
                 return fallback.summary
             raise
         finally:
-            # ensure temporary resume context is cleared after the request
             try:
                 if added_temp:
                     self.rag_engine.clear_temporary_chunks()
